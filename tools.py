@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -69,8 +70,43 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Step 2: price filter (inclusive). Skipped when max_price is None.
+    if max_price is not None:
+        listings = [item for item in listings if item["price"] <= max_price]
+
+    # Step 2: size filter via smart token match. Split each listing's messy
+    # size string on non-alphanumerics so "S/M" -> {S, M}, "US 8.5" -> {US, 8, 5}.
+    # Keep a listing only if the requested size is one of those tokens.
+    if size is not None:
+        wanted = size.strip().upper()
+        listings = [
+            item
+            for item in listings
+            if wanted in set(re.split(r"[^A-Z0-9]+", item["size"].upper()))
+        ]
+
+    # Step 3: score by weighted keyword overlap — tags x2, title x1, description x1.
+    keywords = [w for w in re.split(r"\W+", description.lower()) if w]
+    scored: list[tuple[int, dict]] = []
+    for item in listings:
+        tags = " ".join(item["style_tags"]).lower()
+        title = item["title"].lower()
+        desc = item["description"].lower()
+        score = sum(
+            (2 if kw in tags else 0)
+            + (1 if kw in title else 0)
+            + (1 if kw in desc else 0)
+            for kw in keywords
+        )
+        # Step 4: drop listings with no keyword relevance.
+        if score > 0:
+            scored.append((score, item))
+
+    # Step 5: sort by score, highest first (stable for ties), and return the dicts.
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
