@@ -122,62 +122,117 @@ Gradio panels:   listing  |  outfit  |  fit card     (error path: message in pan
 
 ## How the planning loop works
 
-`run_agent()` runs a **conditional sequential** loop — it does **not** call all three tools every
-time. The control flow:
+**In one sentence:** the "planning loop" is the agent's brain — a function called `run_agent()` that
+decides *which* tool to use, *in what order*, and (most importantly) *when to stop*.
 
-1. Initialize a fresh `session` dict.
-2. **Parse** the query with the LLM (temp 0) → `{description, size, max_price}`, stored in
-   `session["parsed"]`. If the model returns invalid JSON, fall back to searching the raw query.
-3. **Search** with those params → `session["search_results"]`.
-   **🔀 The decision:** if the list is **empty**, write a helpful message to `session["error"]` and
-   **`return` immediately** — `suggest_outfit` and `create_fit_card` are never reached.
-4. Otherwise set `session["selected_item"] = search_results[0]`.
-5. `suggest_outfit(selected_item, wardrobe)` → `session["outfit_suggestion"]`.
-6. `create_fit_card(outfit_suggestion, selected_item)` → `session["fit_card"]`.
-7. Return the session.
+**What "conditional sequential" means, in plain English:**
+- **Sequential** = it does things in a set order, one after another (search → style → caption).
+- **Conditional** = it can change course partway through, depending on what happens. It is *not*
+  locked into running every step no matter what.
 
-The agent's path therefore **changes based on what `search_listings` returns** — that early-exit
-branch is what makes it a planning loop rather than a fixed pipeline.
+**An everyday analogy.** Think of a barista making your order. They work step by step — but if they
+reach for the oat milk and the carton is empty, they *stop* and say "sorry, we're out of oat milk,"
+instead of blindly finishing a drink you can't have. Our agent behaves the same way: if the search
+turns up nothing, it stops and tells you, instead of trying to style and caption an item that doesn't
+exist.
+
+**The steps, walked through one at a time:**
+
+1. **Start fresh.** The agent creates an empty "notepad" (called the `session`) to keep track of
+   everything that happens during this one request.
+2. **Understand the request.** Your sentence — *"vintage graphic tee under $30"* — is just words.
+   The agent asks the AI to pull out the useful pieces: *what* you want (`description`), what `size`,
+   and your `max_price` limit. (If the AI ever hands back something garbled, there's a safety net:
+   the agent just searches using your original sentence rather than giving up.)
+3. **Search — and here is the one big decision. 🔀** The agent searches the listings with those
+   details.
+   - **If nothing matches:** it writes a friendly "couldn't find anything, here's what to try" note
+     and **stops right here.** The styling and caption tools are *never even called.*
+   - **If it finds matches:** it continues.
+4. **Pick the best match** — the top-ranked listing — to work with.
+5. **Style it.** The agent hands that item (plus your wardrobe) to the outfit tool, which suggests
+   how to wear it.
+6. **Caption it.** The agent hands that outfit to the caption tool, which writes the shareable post.
+7. **Return everything** it collected on the notepad.
+
+**Why this is the important part:** the agent's path *changes depending on what the search finds.* A
+successful search runs all three tools; a dead-end search runs only one and stops. That ability to
+*decide* — instead of robotically doing every step every time — is exactly what makes this a real
+**planning loop** and not just a fixed to-do list.
 
 ---
 
-## State management
+## State management — how info is passed between tools
 
-A single `session` dict (created by `_new_session()`) is the one source of truth for an interaction.
-Each step **writes** its output to a field; later steps **read** from those fields — no re-entry, no
-hardcoded values. Data flows **tool → session → tool**.
+**The problem it solves.** The three tools are separate pieces of code — the search tool doesn't
+automatically know anything about the caption tool. So how does the item found in step 1 reach the
+caption written in step 6, *without you having to re-type it*? The answer is a shared **notepad.**
 
-| Field | Set by / when | Read by |
+**The notepad is the `session`.** Think of it like a single **order ticket** at a restaurant: the
+waiter writes your order on it, passes it to the kitchen, the cook adds notes, then it goes to the
+plating station — *one* ticket, carried from person to person, each adding their part. Nobody ever
+re-asks you what you ordered.
+
+In FitFindr, every step **writes** its result onto the session, and every later step **reads** what
+it needs from it. Information flows **tool → session → tool**:
+
+> search writes down the tee it found → the styling tool reads that tee and writes down an outfit →
+> the caption tool reads that outfit and writes the post.
+
+Here is exactly what gets written onto the notepad, *when*, and *who reads it later*:
+
+| Field (a labeled box on the notepad) | Written by / when | Read later by |
 |-------|---------------|---------|
-| `query` | start | parse step |
-| `parsed` | step 2 (LLM parse) | search |
-| `search_results` | step 3 (`search_listings`) | branch check, select |
-| `selected_item` | step 4 (`search_results[0]`) | `suggest_outfit`, `create_fit_card`, UI |
-| `wardrobe` | start (passed in) | `suggest_outfit` |
-| `outfit_suggestion` | step 5 (`suggest_outfit`) | `create_fit_card`, UI |
-| `fit_card` | step 6 (`create_fit_card`) | UI |
-| `error` | step 3 (only if search is empty) | caller / UI |
+| `query` | at the start (your original sentence) | the parse step |
+| `parsed` | step 2 (the AI pulls out description/size/price) | search |
+| `search_results` | step 3 (search's list of matches) | the decision + the "pick best" step |
+| `selected_item` | step 4 (the top match) | `suggest_outfit`, `create_fit_card`, the UI |
+| `wardrobe` | at the start (passed in) | `suggest_outfit` |
+| `outfit_suggestion` | step 5 (the outfit text) | `create_fit_card`, the UI |
+| `fit_card` | step 6 (the caption text) | the UI |
+| `error` | step 3 (only if search found nothing) | the caller / the UI |
 
-**Verified live:** running `python agent.py` prints `selected_item id : lst_006`,
-`outfit_suggestion: 912 chars`, `fit_card: present` on the happy path, and `None / None / None` on the
-no-results path — proving the same item flows through all three tools, and that the downstream tools
-never run when search comes back empty.
+**The key idea:** nothing is ever re-typed or hard-coded between steps. The tee that search found is
+the *exact same tee* the caption talks about, because it rode along on the session the whole way.
+
+**Proof you can see for yourself.** Running `python agent.py` prints the session at the end:
+- On a **successful** query you get `selected_item id : lst_006`, `outfit_suggestion: 912 chars`,
+  `fit_card: present` — every box filled in.
+- On a **dead-end** query you get `None / None / None` — those boxes stay empty, because the agent
+  stopped early and those tools never ran.
+
+That's the state management, made visible.
 
 ---
 
-## Error handling (per tool, with examples from testing)
+## Error handling — failing gracefully instead of crashing
 
-| Tool | Failure mode | Response | Tested example |
+**What "crashing" means (for non-coders).** When a program hits something it didn't expect, it can
+just *stop dead* and dump a scary wall of red text (programmers call it a "traceback"). That's a
+crash — confusing and useless for the person using the app. **Graceful** handling is the opposite:
+when something goes wrong, the program *catches* it and responds with a calm, helpful message — and
+keeps working.
+
+Every tool in FitFindr is built to fail *gracefully.* Here's each thing that can go wrong and what
+the agent does **instead of crashing:**
+
+| Tool | What can go wrong | What it does instead of crashing | Real example from testing |
 |------|--------------|----------|----------------|
-| `search_listings` | No matches | Returns `[]` (never raises). The loop sets `session["error"]` and stops **before** the LLM tools. | `search_listings('designer ballgown', 'XXS', 5)` → `[]`; agent → *"No listings matched 'designer ballgown' in size XXS under $5. Try removing the size filter, raising your max price, or using broader keywords."* |
-| `suggest_outfit` | Empty wardrobe | Switches to a general-styling prompt instead of crashing/returning `""`. | `suggest_outfit(item, get_empty_wardrobe())` → *"This graphic tee has a cool, edgy vibe… pair it with distressed denim jeans and black ankle boots…"* |
-| `create_fit_card` | Empty / whitespace outfit | Returns a descriptive error string **without** calling the LLM. | `create_fit_card('', item)` → *"Can't make a fit card yet — no outfit was generated to caption."* |
-| Planning loop (parse) | LLM returns invalid JSON | Falls back to `{description: raw query, size: None, max_price: None}` so search still runs. | — |
+| `search_listings` | Nothing matches your search | Returns an empty list (not an error). The loop then writes a helpful message and stops **before** the AI tools. | `search_listings('designer ballgown', 'XXS', 5)` → `[]`; agent → *"No listings matched 'designer ballgown' in size XXS under $5. Try removing the size filter, raising your max price, or using broader keywords."* |
+| `suggest_outfit` | You haven't entered a wardrobe yet | Gives **general** styling advice instead of choking on an empty closet. | `suggest_outfit(item, get_empty_wardrobe())` → *"This graphic tee has a cool, edgy vibe… pair it with distressed denim jeans and black ankle boots…"* |
+| `create_fit_card` | There's no outfit to caption | Returns a clear "can't do that yet" message **without** even calling the AI. | `create_fit_card('', item)` → *"Can't make a fit card yet — no outfit was generated to caption."* |
+| Planning loop (parse) | The AI returns garbled, unreadable data | Falls back to searching your original sentence, so the request still works. | — |
 
-**Secondary guard:** every Groq call is wrapped in `try/except`; an API error or empty response
-returns a safe, non-empty fallback string rather than propagating an exception to the user.
+In plain terms:
+- **Search finds nothing?** It returns an empty result (not an error), and the agent tells you what
+  to change.
+- **No wardrobe entered?** The stylist gives general advice instead of breaking on an empty closet.
+- **No outfit to caption?** The caption tool returns a friendly message instead of failing.
 
-These three failure modes are also covered by the test suite (`pytest tests/` → 6 passed).
+**One more safety net:** every call to the AI is wrapped in a "try it, and if it fails, recover"
+block. If the AI service hiccups or returns nothing, the tool hands back a safe backup message rather
+than crashing the whole app. All three failure modes are also locked in by automated tests
+(`pytest tests/` → 6 passed), so we know they keep working.
 
 ---
 
