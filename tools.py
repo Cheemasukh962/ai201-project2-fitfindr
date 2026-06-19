@@ -136,8 +136,64 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    items = wardrobe.get("items", []) if isinstance(wardrobe, dict) else []
+
+    # Describe the new item once, reused by both prompt branches.
+    item_desc = (
+        f'{new_item.get("title", "this item")} '
+        f'(category: {new_item.get("category", "?")}, '
+        f'colors: {", ".join(new_item.get("colors", [])) or "n/a"}, '
+        f'style: {", ".join(new_item.get("style_tags", [])) or "n/a"})'
+    )
+
+    if not items:
+        # Failure-mode branch: empty wardrobe -> general styling advice.
+        prompt = (
+            f"A shopper is considering this secondhand item:\n  {item_desc}\n\n"
+            "They have not entered their wardrobe yet. Give friendly, general styling "
+            "advice: the overall vibe this piece suits, and 2-3 kinds of items "
+            "(by type and color, not specific brands) that would pair well with it. "
+            "Keep it to 3-4 sentences, warm and practical."
+        )
+    else:
+        # Wardrobe-first branch: build outfits around owned pieces, named explicitly.
+        wardrobe_lines = "\n".join(
+            f'  - {it.get("name", "?")} · {it.get("category", "?")} · '
+            f'{", ".join(it.get("style_tags", [])) or "n/a"}'
+            for it in items
+        )
+        prompt = (
+            f"A shopper found this secondhand item:\n  {item_desc}\n\n"
+            f"Their current wardrobe:\n{wardrobe_lines}\n\n"
+            "Suggest 1-2 complete outfits built around the NEW item. Draw mainly from the "
+            "owned pieces listed above and name them exactly as written. You may suggest at "
+            "most ONE item they do not own to finish a look, but clearly flag it as not in "
+            "their closet. Keep it concise (a short paragraph per outfit) and practical."
+        )
+
+    # Single LLM call, guarded so the tool always returns a usable, non-empty string.
+    try:
+        client = _get_groq_client()
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a thoughtful personal stylist who "
+                                              "specializes in secondhand and vintage fashion."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=400,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        out = ""
+
+    if not out:
+        return (
+            "Couldn't generate a full outfit right now — try pairing it with neutral "
+            "basics and your go-to shoes."
+        )
+    return out
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -169,5 +225,43 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # Required failure mode: empty/whitespace outfit -> error string, no LLM call.
+    if not outfit or not outfit.strip():
+        return "Can't make a fit card yet — no outfit was generated to caption."
+
+    title = new_item.get("title", "this piece")
+    price = new_item.get("price", "?")
+    platform = new_item.get("platform", "online")
+
+    prompt = (
+        "Write a short, shareable outfit caption for a thrifted find.\n"
+        f"Item: {title}\n"
+        f"Price: ${price}\n"
+        f"Platform: {platform}\n"
+        f"Outfit: {outfit}\n\n"
+        "Voice: polished and punchy, like a curated OOTD post — proper capitalization, a "
+        "clean hook line, optional 1-2 hashtags. 2-4 sentences. Mention the item name, price, "
+        "and platform once each, naturally. Capture the outfit's vibe in specific terms. "
+        "Sound like a real post, not a product description. Make it fresh and original."
+    )
+
+    # High temperature so different inputs (and reruns) produce different captions.
+    try:
+        client = _get_groq_client()
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You write catchy, authentic fashion captions "
+                                              "for secondhand finds."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=1.0,
+            max_tokens=200,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        out = ""
+
+    if not out:
+        return "Couldn't write a fit card right now — give it another try in a moment."
+    return out

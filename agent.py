@@ -18,7 +18,15 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+import json
+import re
+
+from tools import (
+    search_listings,
+    suggest_outfit,
+    create_fit_card,
+    _get_groq_client,
+)
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -43,6 +51,54 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
     }
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Use the LLM (temperature 0) to extract structured search parameters from a
+    free-text request, returning {"description", "size", "max_price"}.
+
+    Falls back to {"description": query, "size": None, "max_price": None} on ANY
+    failure (bad JSON, network error, etc.) so a bad parse never crashes the run.
+    """
+    prompt = (
+        "Extract thrift-search parameters from the request below. "
+        "Respond with ONLY a JSON object, no prose, using exactly these keys:\n"
+        '  "description": string of item keywords (no size/price words)\n'
+        '  "size": a size string like "M" or "8", or null if not mentioned\n'
+        '  "max_price": a number, or null if not mentioned\n\n'
+        f"Request: {query}\n\n"
+        'Example -> {"description": "vintage graphic tee", "size": "M", "max_price": 30}'
+    )
+    try:
+        client = _get_groq_client()
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        # Pull the first {...} block out of the reply (handles ```json fences / prose).
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        data = json.loads(match.group(0)) if match else {}
+
+        size = data.get("size")
+        max_price = data.get("max_price")
+        if max_price is not None:
+            try:
+                max_price = float(max_price)
+            except (TypeError, ValueError):
+                max_price = None
+        return {
+            "description": data.get("description") or query,
+            "size": str(size) if size is not None else None,
+            "max_price": max_price,
+        }
+    except Exception:
+        # Defensive fallback: search on the raw query with no filters.
+        return {"description": query, "size": None, "max_price": None}
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
@@ -92,9 +148,36 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse the free-text query into description / size / max_price.
+    session["parsed"] = _parse_query(query)
+    p = session["parsed"]
+
+    # Step 3: search. The planning decision lives here — empty results stop the run.
+    results = search_listings(p["description"], p.get("size"), p.get("max_price"))
+    session["search_results"] = results
+    if not results:
+        size_txt = f' in size {p["size"]}' if p.get("size") else ""
+        price_txt = f' under ${p["max_price"]:g}' if p.get("max_price") else ""
+        session["error"] = (
+            f'No listings matched "{p["description"]}"{size_txt}{price_txt}. '
+            "Try removing the size filter, raising your max price, or using broader keywords."
+        )
+        return session
+
+    # Step 4: pick the top-ranked match.
+    session["selected_item"] = results[0]
+
+    # Step 5: outfit built from the selected item + the user's wardrobe.
+    session["outfit_suggestion"] = suggest_outfit(session["selected_item"], wardrobe)
+
+    # Step 6: shareable fit card built from the outfit + the item.
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 7: return the completed session.
     return session
 
 
@@ -115,9 +198,22 @@ if __name__ == "__main__":
         print(f"\nOutfit: {session['outfit_suggestion']}")
         print(f"\nFit card: {session['fit_card']}")
 
+    # State check — the exact session fields handed from one tool to the next.
+    print("\n-- state passed between tools --")
+    item = session["selected_item"]
+    outfit = session["outfit_suggestion"] or ""
+    print(f"  selected_item id : {item['id'] if item else None}")
+    print(f"  outfit_suggestion: {len(outfit)} chars")
+    print(f"  fit_card         : {'present' if session['fit_card'] else None}")
+
     print("\n\n=== No-results path ===\n")
     session2 = run_agent(
         query="designer ballgown size XXS under $5",
         wardrobe=get_example_wardrobe(),
     )
     print(f"Error message: {session2['error']}")
+    # The branch must stop early: downstream tools never ran, so these stay None.
+    print("\n-- state after early return --")
+    print(f"  selected_item    : {session2['selected_item']}")
+    print(f"  outfit_suggestion: {session2['outfit_suggestion']}")
+    print(f"  fit_card         : {session2['fit_card']}")
