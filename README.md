@@ -8,6 +8,7 @@ sequence, carrying state between them, and handling failures gracefully at each 
 Built for CodePath AI201, Week 2 (Multi-Tool AI Agents). LLM: **Groq `llama-3.3-70b-versatile`**.
 
 ---
+**Video Demo: https://youtu.be/SaeSsHOAdDQ**
 
 ## What it does (example interaction)
 
